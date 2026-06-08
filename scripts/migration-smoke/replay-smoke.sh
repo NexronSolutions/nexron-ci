@@ -7,18 +7,20 @@
 # cleanly, deterministically, and without leaking member PII into the baseline.
 #
 # What it does (no secrets, never connects to any Supabase project / prod):
-#   1. Starts two clean, pinned Postgres containers.
-#   2. Applies every top-level <14-digit-timestamp>_*.sql in version (lexical)
+#   1. PII gate (baseline file only), run FIRST so a dirty baseline aborts before
+#      any psql/apply can echo its literals into logs. BLOCKING on true
+#      data-bearing/PII signals (email literals, the `matched_text` column,
+#      top-level `COPY … FROM stdin` data blocks); the broader §8.8
+#      INSERT/UPDATE/VALUES pattern is ADVISORY only (printed, never fails —
+#      pg_dump --schema-only legitimately emits those inside CREATE FUNCTION
+#      bodies). See the Path B plan §2 req#5 / §6 T-C.
+#   2. Starts two clean, pinned Postgres containers.
+#   3. Applies every top-level <14-digit-timestamp>_*.sql in version (lexical)
 #      order, as role `postgres`, with ON_ERROR_STOP=1, check_function_bodies=off,
 #      client_min_messages=warning. Skips _archive/ and non-timestamp files
 #      (mirrors the Supabase CLI's non-recursive discovery).
-#   3. Determinism: pg_dump --schema-only both containers and asserts the dumps
+#   4. Determinism: pg_dump --schema-only both containers and asserts the dumps
 #      are byte-identical modulo per-invocation cosmetic tokens (\restrict).
-#   4. PII gate (baseline file only): BLOCKING on true data-bearing/PII signals
-#      (email literals, the `matched_text` column, top-level `COPY … FROM stdin`
-#      data blocks); the broader §8.8 INSERT/UPDATE/VALUES pattern is ADVISORY
-#      only (printed, never fails — pg_dump --schema-only legitimately emits those
-#      inside CREATE FUNCTION bodies). See the Path B plan §2 req#5 / §6 T-C.
 #
 # Parameterised by env (portable; no repo-specific paths):
 #   MIGRATIONS_DIR  default: supabase/migrations
@@ -83,6 +85,40 @@ log "  migrations:   $MIGRATIONS_DIR (${#MIGRATIONS[@]} files, version order)"
 log "  apply role:   $APPLY_ROLE"
 log "  baseline:     $BASELINE_FILE"
 
+# ---- 1. PII gate (baseline only) — runs BEFORE any container/apply ----------
+# Ordering matters: scanning first means a dirty baseline aborts here, before
+# apply/psql can echo its literals via an error tail into the logs + job summary.
+# NEVER print matched line CONTENT: a real hit would leak the very
+# email/secret/PII we're gating on. Scan in count-only mode (rg -c prints counts,
+# never line bodies) and report redacted counts; inspect locally if a gate trips.
+# Fail CLOSED: rg exits 0=match, 1=clean no-match, >=2=real error (bad PCRE / IO).
+# A security scanner that silently passes on its own error is worse than useless,
+# so an rg error aborts the gate rather than counting as "clean".
+hdr "PII / secret scan (baseline: $(basename "$BASELINE_FILE"))"
+pii_hit=0
+scan_redacted() {
+  local label="$1" pattern="$2" n rc=0
+  n="$(rg -cP -- "$pattern" "$BASELINE_FILE" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    fail "PII scanner error (rg rc=$rc) on pattern [$label] — refusing to pass (fail-closed)"
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$n" ] && [ "$n" != "0" ]; then
+    printf '  BLOCKING: %s — %s matching line(s) in baseline (content redacted)\n' "$label" "$n" >&2
+    pii_hit=1
+  fi
+}
+scan_redacted "email literal"                '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+scan_redacted "matched_text (PII free-text)" 'matched_text'
+# Case-insensitive + allows leading whitespace so an indented/lowercase data dump
+# can't slip past (superset of the plan's `^COPY .+ FROM stdin`).
+scan_redacted "top-level COPY … FROM stdin"  '(?i)^\s*COPY\s+.+\s+FROM\s+stdin\b'
+[ "$pii_hit" -eq 0 ] || fail "baseline contains data-bearing / PII signal(s) — see redacted counts above; run the scan locally to inspect the offending lines"
+log "  BLOCKING scans clean (no email literals, no matched_text, no COPY data)"
+
+log "  advisory (parent-plan §8.8 — CREATE FUNCTION-body DDL, not data; informational only):"
+adv_count="$(rg -c "\b(INSERT INTO|UPDATE public\.|DELETE FROM|VALUES|COPY|DO \\\$\\\$)" "$BASELINE_FILE" || true)"
+log "    ${adv_count:-0} advisory §8.8 line(s) in baseline (expected: function-body statements)"
+
 # ---- container lifecycle ----------------------------------------------------
 start_container() {
   local name="$1"
@@ -142,7 +178,7 @@ count_objects() {
   docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -t -A -c "$sql" 2>/dev/null | tr -d '[:space:]'
 }
 
-# ---- 1+2. start + apply -----------------------------------------------------
+# ---- 2+3. start + apply -----------------------------------------------------
 hdr "Starting clean containers ($PG_IMAGE)"
 start_container "$C1"
 start_container "$C2"
@@ -155,7 +191,7 @@ hdr "Applying same set to container 2 (determinism substrate)"
 apply_all "$C2" 0
 log "  container 2 applied OK"
 
-# ---- 3. determinism dump-diff ----------------------------------------------
+# ---- 4. determinism dump-diff ----------------------------------------------
 hdr "Determinism check (pg_dump --schema-only, two fresh containers)"
 dump_schema "$C1" "$WORKDIR/dump1.sql"
 dump_schema "$C2" "$WORKDIR/dump2.sql"
@@ -166,39 +202,6 @@ else
   head -n 60 "$WORKDIR/dump.diff" >&2
   fail "non-deterministic replay: schema dumps differ between two clean applies"
 fi
-
-# ---- 4. PII gate (baseline only) -------------------------------------------
-# NEVER print matched line CONTENT here: a real hit would echo the very
-# email/secret/PII we're gating on into the CI logs + job summary (the detector
-# leaking what it guards). Scan in count-only mode (rg -c prints counts, never
-# line bodies) and report redacted counts; inspect locally if a gate trips.
-hdr "PII / secret scan (baseline: $(basename "$BASELINE_FILE"))"
-pii_hit=0
-# Fail CLOSED: rg exits 0=match, 1=clean no-match, >=2=real error (bad PCRE / IO).
-# A security scanner that silently passes on its own error is worse than useless,
-# so an rg error aborts the gate rather than counting as "clean".
-scan_redacted() {
-  local label="$1" pattern="$2" n rc=0
-  n="$(rg -cP -- "$pattern" "$BASELINE_FILE" 2>/dev/null)" || rc=$?
-  if [ "$rc" -ge 2 ]; then
-    fail "PII scanner error (rg rc=$rc) on pattern [$label] — refusing to pass (fail-closed)"
-  fi
-  if [ "$rc" -eq 0 ] && [ -n "$n" ] && [ "$n" != "0" ]; then
-    printf '  BLOCKING: %s — %s matching line(s) in baseline (content redacted)\n' "$label" "$n" >&2
-    pii_hit=1
-  fi
-}
-scan_redacted "email literal"                '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-scan_redacted "matched_text (PII free-text)" 'matched_text'
-# Case-insensitive + allows leading whitespace so an indented/lowercase data dump
-# can't slip past (superset of the plan's `^COPY .+ FROM stdin`).
-scan_redacted "top-level COPY … FROM stdin"  '(?i)^\s*COPY\s+.+\s+FROM\s+stdin\b'
-[ "$pii_hit" -eq 0 ] || fail "baseline contains data-bearing / PII signal(s) — see redacted counts above; run the scan locally to inspect the offending lines"
-log "  BLOCKING scans clean (no email literals, no matched_text, no COPY data)"
-
-log "  advisory (parent-plan §8.8 — CREATE FUNCTION-body DDL, not data; informational only):"
-adv_count="$(rg -c "\b(INSERT INTO|UPDATE public\.|DELETE FROM|VALUES|COPY|DO \\\$\\\$)" "$BASELINE_FILE" || true)"
-log "    ${adv_count:-0} advisory §8.8 line(s) in baseline (expected: function-body statements)"
 
 # ---- summary ----------------------------------------------------------------
 tables="$(count_objects "$C1" "SELECT count(*) FROM pg_tables WHERE schemaname='public';")"

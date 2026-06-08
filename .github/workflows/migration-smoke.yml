@@ -39,6 +39,10 @@ jobs:
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Don't leave the job token in the checkout's git config — this gate
+          # only reads files; it never pushes.
+          persist-credentials: false
 
       - name: Checkout nexron-ci (replay-smoke script)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -46,6 +50,9 @@ jobs:
           repository: NexronS2025/nexron-ci
           ref: v1
           path: .nexron-ci
+          # Public repo, read-only fetch: no token needed, and don't persist one.
+          token: ''
+          persist-credentials: false
 
       - name: Run migration-smoke replay
         env:
