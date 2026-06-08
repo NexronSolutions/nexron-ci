@@ -168,18 +168,24 @@ else
 fi
 
 # ---- 4. PII gate (baseline only) -------------------------------------------
+# NEVER print matched line CONTENT here: a real hit would echo the very
+# email/secret/PII we're gating on into the CI logs + job summary (the detector
+# leaking what it guards). Scan in count-only mode (rg -c prints counts, never
+# line bodies) and report redacted counts; inspect locally if a gate trips.
 hdr "PII / secret scan (baseline: $(basename "$BASELINE_FILE"))"
 pii_hit=0
-if rg -nP '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$BASELINE_FILE"; then
-  log "  ^ BLOCKING: email literal(s) in baseline" >&2; pii_hit=1
-fi
-if rg -n 'matched_text' "$BASELINE_FILE"; then
-  log "  ^ BLOCKING: 'matched_text' (PII free-text column) in baseline" >&2; pii_hit=1
-fi
-if rg -nP '^COPY .+ FROM stdin' "$BASELINE_FILE"; then
-  log "  ^ BLOCKING: top-level COPY … FROM stdin data block in baseline" >&2; pii_hit=1
-fi
-[ "$pii_hit" -eq 0 ] || fail "baseline contains data-bearing / PII signals (see above)"
+scan_redacted() {
+  local label="$1" pattern="$2" n
+  n="$(rg -cP -- "$pattern" "$BASELINE_FILE" 2>/dev/null || true)"
+  if [ -n "$n" ] && [ "$n" != "0" ]; then
+    printf '  BLOCKING: %s — %s matching line(s) in baseline (content redacted)\n' "$label" "$n" >&2
+    pii_hit=1
+  fi
+}
+scan_redacted "email literal"                '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+scan_redacted "matched_text (PII free-text)" 'matched_text'
+scan_redacted "top-level COPY … FROM stdin"  '^COPY .+ FROM stdin'
+[ "$pii_hit" -eq 0 ] || fail "baseline contains data-bearing / PII signal(s) — see redacted counts above; run the scan locally to inspect the offending lines"
 log "  BLOCKING scans clean (no email literals, no matched_text, no COPY data)"
 
 log "  advisory (parent-plan §8.8 — CREATE FUNCTION-body DDL, not data; informational only):"
