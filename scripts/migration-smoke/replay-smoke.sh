@@ -174,17 +174,25 @@ fi
 # line bodies) and report redacted counts; inspect locally if a gate trips.
 hdr "PII / secret scan (baseline: $(basename "$BASELINE_FILE"))"
 pii_hit=0
+# Fail CLOSED: rg exits 0=match, 1=clean no-match, >=2=real error (bad PCRE / IO).
+# A security scanner that silently passes on its own error is worse than useless,
+# so an rg error aborts the gate rather than counting as "clean".
 scan_redacted() {
-  local label="$1" pattern="$2" n
-  n="$(rg -cP -- "$pattern" "$BASELINE_FILE" 2>/dev/null || true)"
-  if [ -n "$n" ] && [ "$n" != "0" ]; then
+  local label="$1" pattern="$2" n rc=0
+  n="$(rg -cP -- "$pattern" "$BASELINE_FILE" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    fail "PII scanner error (rg rc=$rc) on pattern [$label] — refusing to pass (fail-closed)"
+  fi
+  if [ "$rc" -eq 0 ] && [ -n "$n" ] && [ "$n" != "0" ]; then
     printf '  BLOCKING: %s — %s matching line(s) in baseline (content redacted)\n' "$label" "$n" >&2
     pii_hit=1
   fi
 }
 scan_redacted "email literal"                '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 scan_redacted "matched_text (PII free-text)" 'matched_text'
-scan_redacted "top-level COPY … FROM stdin"  '^COPY .+ FROM stdin'
+# Case-insensitive + allows leading whitespace so an indented/lowercase data dump
+# can't slip past (superset of the plan's `^COPY .+ FROM stdin`).
+scan_redacted "top-level COPY … FROM stdin"  '(?i)^\s*COPY\s+.+\s+FROM\s+stdin\b'
 [ "$pii_hit" -eq 0 ] || fail "baseline contains data-bearing / PII signal(s) — see redacted counts above; run the scan locally to inspect the offending lines"
 log "  BLOCKING scans clean (no email literals, no matched_text, no COPY data)"
 
