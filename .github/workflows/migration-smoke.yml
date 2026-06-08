@@ -1,0 +1,68 @@
+name: migration-smoke
+
+# Reusable Phase 1 migration-smoke gate (Path B, closes BUG-078).
+#
+# Spins up a clean, pinned Postgres container, replays a repo's committed
+# Supabase migrations from scratch, asserts the replay is clean + deterministic,
+# and PII-scans the baseline. NO secrets; never connects to any Supabase project
+# or prod. Adopt it from a product repo with a thin caller:
+#
+#   jobs:
+#     migration-smoke:
+#       uses: NexronS2025/nexron-ci/.github/workflows/migration-smoke.yml@v1
+#
+# The replay logic lives in scripts/migration-smoke/replay-smoke.sh in THIS repo,
+# so the workflow checks this repo out alongside the caller to fetch the script.
+# That second checkout is tokenless (this repo is public), keeping Phase 1
+# secret-free.
+
+on:
+  workflow_call:
+    inputs:
+      migrations_dir:
+        description: 'Path to the migrations directory in the caller repo.'
+        type: string
+        required: false
+        default: 'supabase/migrations'
+      pg_image:
+        description: 'Pinned Postgres image (must match prod engine + roles + extensions).'
+        type: string
+        required: false
+        default: 'supabase/postgres:17.6.1.084'
+
+jobs:
+  replay:
+    name: replay-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Checkout nexron-ci (replay-smoke script)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: NexronS2025/nexron-ci
+          ref: v1
+          path: .nexron-ci
+
+      - name: Run migration-smoke replay
+        env:
+          MIGRATIONS_DIR: ${{ inputs.migrations_dir }}
+          PG_IMAGE: ${{ inputs.pg_image }}
+        run: |
+          chmod +x .nexron-ci/scripts/migration-smoke/replay-smoke.sh
+          set +e
+          .nexron-ci/scripts/migration-smoke/replay-smoke.sh > smoke.log 2>&1
+          rc=$?
+          set -e
+          cat smoke.log
+          {
+            echo '### Migration-smoke replay'
+            echo ''
+            echo '```'
+            cat smoke.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
