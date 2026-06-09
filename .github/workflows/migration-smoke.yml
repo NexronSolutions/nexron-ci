@@ -48,10 +48,15 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: NexronS2025/nexron-ci
-          ref: v1
+          # Pin the script to the SAME immutable commit that @v1 resolved to for
+          # this run, so callers keep using @v1 (reuse model intact, no
+          # hand-bumping) yet can never be served retagged script code.
+          # github.job_workflow_sha is the reusable-workflow's own commit SHA.
+          # (If it is ever empty/unavailable, fall back to `v1` — the gate is
+          # advisory with nil blast radius; see the PR notes / §3 Phase-2 prereq.)
+          ref: ${{ github.job_workflow_sha }}
           path: .nexron-ci
-          # Public repo, read-only fetch: no token needed, and don't persist one.
-          token: ''
+          # Public repo: don't leave the job token in the checkout's git config.
           persist-credentials: false
 
       - name: Run migration-smoke replay
