@@ -59,6 +59,20 @@ jobs:
           # Public repo: don't leave the job token in the checkout's git config.
           persist-credentials: false
 
+      - name: Ensure ripgrep is on PATH (PII-scan dependency)
+        # The replay script's PII/secret gate uses `rg` and its preflight aborts
+        # (~7s, before any replay) if rg is missing. The GitHub-hosted runner does
+        # not ship ripgrep, so install it here, BEFORE the scan runs. Guarded so it
+        # is a no-op (and pays no apt cost) if a future runner image already has rg.
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "ripgrep already present: $(rg --version | head -n1)"
+          else
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+            echo "ripgrep installed: $(rg --version | head -n1)"
+          fi
+
       - name: Run migration-smoke replay
         env:
           MIGRATIONS_DIR: ${{ inputs.migrations_dir }}
