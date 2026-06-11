@@ -29,6 +29,25 @@ project or prod**; it runs entirely against ephemeral local containers.
    `pg_dump --schema-only` legitimately emits those inside `CREATE FUNCTION`
    bodies.
 
+### Storage platform-schema stub (BUG-087)
+
+Supabase provisions the `storage` schema (and its `buckets`/`objects` tables)
+via the storage-api service. A bare `supabase/postgres` engine container ships
+the empty schema but **no** tables, so a migration that does platform-schema DML
+— e.g. `insert into storage.buckets …` — would abort the clean replay. Before
+applying any migration, the harness seeds a minimal, Supabase-shaped stub on
+**both** determinism containers: `storage.buckets` and `storage.objects` with the
+column set Supabase ships (`id`/`name`/`public`/`owner`/`bucket_id`/`created_at`/
+`updated_at` + PK/FK), RLS enabled on both. The stub is created as
+`supabase_storage_admin` (the role that owns these tables on prod) over the
+image's localhost-trust `pg_hba` rule — still **no secrets** — and the apply role
+is granted the privileges its DML needs.
+
+The stub covers `buckets` + `objects` only. A migration touching any **other**
+platform-managed schema/object needs a harness PR to extend the stub first — it
+is not a licence for arbitrary `storage`/`auth`/… DML. See the consuming repo's
+`supabase/migrations/README.md` note.
+
 ### Adopt it (thin caller in a product repo)
 
 `.github/workflows/migration-smoke.yml`:
@@ -59,6 +78,18 @@ PG_IMAGE=supabase/postgres:17.6.1.084 MIGRATIONS_DIR=supabase/migrations \
 ```
 
 Requires `docker` and `ripgrep` (`rg`) on `PATH`.
+
+### Regression tests
+
+```bash
+bash scripts/migration-smoke/test/run-tests.sh
+```
+
+Drives the gate against fixed fixtures and asserts each behaves as it should: a
+known-good set whose later migration does `storage.buckets` DML must **pass**
+(guards the BUG-087 stub), and the `bad-email` / `bad-matched-text` / `bad-copy`
+fixtures must **fail** (guard the blocking PII gate). Same `docker` + `rg`
+prerequisites as the script itself.
 
 ### Rollout
 

@@ -125,8 +125,18 @@ start_container() {
   docker run -d --name "$name" \
     -e POSTGRES_PASSWORD=postgres \
     "$PG_IMAGE" >/dev/null
+  # Wait for the FINAL server, not the temporary bootstrap server.
+  # supabase/postgres double-starts: a throwaway server runs the image's own
+  # /docker-entrypoint-initdb.d migrations (which create the storage schema +
+  # the supabase_* roles + grants), then shuts down and the real server starts.
+  # That temp server answers on the unix socket, so a socket-only `pg_isready`
+  # goes green mid-bootstrap — before roles/grants settle. The temp server does
+  # NOT open TCP; only the final server listens on 127.0.0.1, so a TCP probe is
+  # the gate that excludes the bootstrap phase (also true for a plain postgres
+  # image, whose initdb server is socket-only too). Require both.
   local waited=0
-  until docker exec "$name" pg_isready -U "$APPLY_ROLE" -d "$APPLY_DB" -q >/dev/null 2>&1; do
+  until docker exec "$name" pg_isready -U "$APPLY_ROLE" -d "$APPLY_DB" -q >/dev/null 2>&1 \
+        && docker exec "$name" pg_isready -h 127.0.0.1 -U "$APPLY_ROLE" -d "$APPLY_DB" -q >/dev/null 2>&1; do
     sleep 2; waited=$((waited + 2))
     if [ "$waited" -ge "$READY_TIMEOUT" ]; then
       docker logs "$name" 2>&1 | tail -n 40 >&2
@@ -164,6 +174,76 @@ apply_all() {
   return 0
 }
 
+# Seed a minimal Supabase-shaped `storage` schema on a fresh container BEFORE
+# replay (BUG-087). On real Supabase the storage tables are provisioned by the
+# storage-api service; the bare engine image ships an EMPTY `storage` schema
+# (owned by supabase_admin) but no buckets/objects tables, so a migration doing
+# platform-schema DML (e.g. `insert into storage.buckets …` — present on prod,
+# R15 byte-locked, not editable) aborts under ON_ERROR_STOP. We stub only the
+# column set Supabase ships (id/name/public/owner/bucket_id/created_at/updated_at
+# + PK/FK), with RLS enabled on both tables. `objects` is included now because a
+# later campaigns unit adds storage policies, which would otherwise re-break the
+# gate.
+#
+# Roles: the apply role `postgres` holds only USAGE (not CREATE) on the
+# supabase_admin-owned `storage` schema, so it cannot create the tables — exactly
+# as on prod, where storage-api (role supabase_storage_admin) owns them. So we
+# seed AS supabase_storage_admin (the one non-superuser role the image grants
+# CREATE on `storage`), mirroring prod ownership, then GRANT the apply role the
+# table privileges its DML needs. `postgres` carries BYPASSRLS on this image (as
+# on prod), so its inserts still resolve despite RLS being enabled. Connecting as
+# supabase_storage_admin uses the image's `host … 127.0.0.1/32 trust` pg_hba rule
+# (the unix socket is peer-mapped to `postgres` only) — no password, no secret.
+#
+# Seeded IDENTICALLY on BOTH determinism containers, so the byte-identical
+# pg_dump assertion stays valid. Anything beyond buckets/objects needs a harness
+# PR first (see the pnbhs-crm supabase/migrations/README.md note).
+STORAGE_SEED_ROLE="${STORAGE_SEED_ROLE:-supabase_storage_admin}"
+STORAGE_STUB_SQL="
+create schema if not exists storage;
+
+create table if not exists storage.buckets (
+  id         text        not null primary key,
+  name       text        not null,
+  owner      uuid,
+  public     boolean     default false,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+create table if not exists storage.objects (
+  id         uuid        not null default gen_random_uuid() primary key,
+  bucket_id  text        references storage.buckets (id),
+  name       text,
+  owner      uuid,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table storage.buckets enable row level security;
+alter table storage.objects enable row level security;
+
+grant all on storage.buckets, storage.objects to ${APPLY_ROLE};
+"
+
+seed_storage_stub() {
+  local name="$1" out
+  out="$WORKDIR/seed.out"
+  # Connect over TCP (host 127.0.0.1 → trust per the image pg_hba) as the
+  # storage-owner role, which is the only practical way to obtain CREATE on the
+  # platform-owned `storage` schema. -h 127.0.0.1 also pins us to the final
+  # server (the bootstrap server is socket-only).
+  if printf '%s\n' "$STORAGE_STUB_SQL" \
+        | docker exec -i "$name" psql -h 127.0.0.1 -U "$STORAGE_SEED_ROLE" -d "$APPLY_DB" \
+            -X -q -v ON_ERROR_STOP=1 -f - >"$out" 2>&1; then
+    return 0
+  fi
+  printf '\nSTORAGE STUB SEED FAILED on %s (seed role: %s)\n----- error (tail) -----\n' \
+    "$name" "$STORAGE_SEED_ROLE" >&2
+  tail -n 40 "$out" >&2
+  return 1
+}
+
 # Normalise a schema dump for determinism comparison: blank the random token on
 # the per-invocation \restrict / \unrestrict psql meta-commands (PG17 feature),
 # which differ every dump but are cosmetic.
@@ -183,6 +263,14 @@ hdr "Starting clean containers ($PG_IMAGE)"
 start_container "$C1"
 start_container "$C2"
 log "  both containers ready"
+
+# Seed the storage platform-schema stub on BOTH containers before any apply, so
+# migrations doing storage.* DML replay cleanly and both determinism substrates
+# stay identical (BUG-087).
+hdr "Seeding storage platform-schema stub on both containers (BUG-087)"
+seed_storage_stub "$C1" || fail "storage stub seed failed on container 1"
+seed_storage_stub "$C2" || fail "storage stub seed failed on container 2"
+log "  storage stub seeded on both containers (buckets + objects, RLS enabled)"
 
 hdr "Applying ${#MIGRATIONS[@]} migrations to container 1 (version order)"
 apply_all "$C1" 1
@@ -209,6 +297,7 @@ funcs="$(count_objects "$C1" "SELECT count(*) FROM pg_proc p JOIN pg_namespace n
 
 hdr "MIGRATION-SMOKE PASSED"
 log "  migrations applied:   ${#MIGRATIONS[@]}"
+log "  storage stub:         seeded on both containers (buckets + objects, RLS)"
 log "  determinism:          OK (dumps identical modulo \\restrict)"
 log "  baseline PII gate:    OK (blocking signals: 0)"
 log "  public tables:        ${tables:-?}"
