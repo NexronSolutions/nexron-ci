@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "deny": [
+      "mcp__claude-in-chrome__*",
+      "mcp__claude_ai_*",
+      "mcp__claude_ai_Cloudflare",
+      "mcp__claude_ai_Cloudflare_Developer_Platform",
+      "mcp__claude_ai_Firecrawl",
+      "mcp__claude_ai_Gmail",
+      "mcp__claude_ai_Google_Calendar",
+      "mcp__claude_ai_Google_Drive",
+      "mcp__claude_ai_Stripe",
+      "mcp__claude_ai_Supabase",
+      "mcp__claude_ai_Xero",
+      "mcp__claude_ai_n8n",
+      "mcp__playwright__*",
+      "mcp__plugin_*"
+    ]
+  }
+}
