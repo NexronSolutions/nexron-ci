@@ -211,6 +211,26 @@ create table if not exists storage.buckets (
   updated_at timestamptz default now()
 );
 
+-- Bucket-CONFIG columns. The original stub covered only identity columns, which
+-- was enough for a bucket insert that just names a bucket. It is not enough for
+-- one that configures it: pnbhs-crm 20260708120200_event_expense_receipts_bucket
+-- inserts file_size_limit + allowed_mime_types and aborted the whole replay with
+--   ERROR: column \"file_size_limit\" of relation \"buckets\" does not exist
+-- Verified against the live project, where storage.buckets carries these.
+--
+-- Added via ALTER … IF NOT EXISTS rather than inside the CREATE above so the
+-- stub also repairs an image whose storage.buckets already exists in an older
+-- shape (observed: the amd64 image ships the table pre-dating these columns,
+-- while arm64 ships no storage tables at all — CREATE IF NOT EXISTS alone
+-- silently leaves the amd64 case short).
+alter table storage.buckets add column if not exists file_size_limit    bigint;
+alter table storage.buckets add column if not exists allowed_mime_types text[];
+alter table storage.buckets add column if not exists avif_autodetection boolean default false;
+alter table storage.buckets add column if not exists owner_id           text;
+-- Not stubbed: storage.buckets.type (enum storage.buckettype). No migration
+-- references it, and adding a custom type is more platform surface than the gate
+-- needs. Add it here if one ever does.
+
 create table if not exists storage.objects (
   id         uuid        not null default gen_random_uuid() primary key,
   bucket_id  text        references storage.buckets (id),
