@@ -41,7 +41,7 @@ on:
       - 'supabase/migrations/**'
 jobs:
   migration-smoke:
-    uses: NexronS2025/nexron-ci/.github/workflows/migration-smoke.yml@v1
+    uses: NexronSolutions/nexron-ci/.github/workflows/migration-smoke.yml@v1
 ```
 
 Inputs (both optional):

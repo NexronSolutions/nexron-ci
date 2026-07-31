@@ -37,6 +37,12 @@ MIGRATIONS_DIR="${MIGRATIONS_DIR:-supabase/migrations}"
 PG_IMAGE="${PG_IMAGE:-supabase/postgres:17.6.1.084}"
 APPLY_ROLE="postgres"             # mirrors `supabase db push` / apply_migration
 APPLY_DB="postgres"
+# Superuser used ONLY by the managed-schema shim (it owns the storage schema in
+# this image). Migrations are never applied as this role — the gate would stop
+# catching genuine permission defects. Password matches start_container's
+# POSTGRES_PASSWORD; keep the two in step.
+ADMIN_ROLE="supabase_admin"
+ADMIN_PASS="postgres"
 READY_TIMEOUT="${READY_TIMEOUT:-90}"   # seconds to wait for each container
 
 # Unique-ish container names (no Date.now/rand needed: PID is enough for a run).
@@ -123,7 +129,7 @@ log "    ${adv_count:-0} advisory §8.8 line(s) in baseline (expected: function-
 start_container() {
   local name="$1"
   docker run -d --name "$name" \
-    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_PASSWORD="$ADMIN_PASS" \
     "$PG_IMAGE" >/dev/null
   local waited=0
   until docker exec "$name" pg_isready -U "$APPLY_ROLE" -d "$APPLY_DB" -q >/dev/null 2>&1; do
@@ -133,6 +139,118 @@ start_container() {
       fail "container $name not ready after ${READY_TIMEOUT}s"
     fi
   done
+}
+
+# ---- Supabase-managed schema shim -------------------------------------------
+# The pinned base image is Postgres + Supabase extensions/roles. It is NOT a
+# running Supabase project, so schemas owned by the SERVICE layer (storage, and
+# anything else the platform migrates independently of us) are absent or lag the
+# shape a real project has. That is not a defect in the product repo's migrations:
+# a migration that legitimately configures a storage bucket cannot replay against
+# a container where storage.buckets has never been created by the storage service.
+#
+# Observed concretely: on the amd64 image storage.buckets exists but predates
+# file_size_limit / allowed_mime_types; on arm64 the storage schema has no tables
+# at all. Either way a migration touching storage aborts the whole replay and the
+# gate reports a failure that says nothing about the migrations under test.
+#
+# So: before replaying, bring the managed surface up to the shape prod actually
+# has. Modelled on the live project's storage.buckets (11 columns, incl. the
+# storage.buckettype enum). Strictly additive and idempotent — CREATE IF NOT
+# EXISTS / ADD COLUMN IF NOT EXISTS — so on an image that already ships the full
+# shape this is a no-op and the replay still exercises the real thing.
+#
+# This shim is deliberately NARROW. It covers only what a product migration is
+# entitled to assume exists; it does not simulate the storage service's behaviour,
+# and it must never be extended to paper over a genuine defect in a migration.
+managed_schema_shim() {
+  local name="$1" out="$WORKDIR/shim.out"
+  # Do NOT swallow this. A silently-failing shim resurfaces later as a confusing
+  # migration failure with the real cause thrown away.
+  # Runs as supabase_admin, not "$APPLY_ROLE": the storage schema is owned by
+  # supabase_admin in this image and postgres cannot create in it. The storage
+  # SERVICE would have made these objects; supabase_admin is the closest stand-in.
+  if ! docker exec -i -e PGPASSWORD="$ADMIN_PASS" "$name" psql -U "$ADMIN_ROLE" -d "$APPLY_DB" \
+        -X -q -v ON_ERROR_STOP=1 -f - >"$out" 2>&1 <<'SHIM'
+CREATE SCHEMA IF NOT EXISTS storage;
+
+DO $shim$
+BEGIN
+  IF to_regtype('storage.buckettype') IS NULL THEN
+    CREATE TYPE storage.buckettype AS ENUM ('STANDARD', 'ANALYTICS');
+  END IF;
+END
+$shim$;
+
+CREATE TABLE IF NOT EXISTS storage.buckets (
+  id                 text PRIMARY KEY,
+  name               text NOT NULL,
+  owner              uuid,
+  created_at         timestamptz DEFAULT now(),
+  updated_at         timestamptz DEFAULT now(),
+  public             boolean DEFAULT false,
+  avif_autodetection boolean DEFAULT false,
+  file_size_limit    bigint,
+  allowed_mime_types text[],
+  owner_id           text,
+  type               storage.buckettype NOT NULL DEFAULT 'STANDARD'
+);
+
+-- Older image shape: table present, newer columns missing.
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS public             boolean DEFAULT false;
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS avif_autodetection boolean DEFAULT false;
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS file_size_limit    bigint;
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS allowed_mime_types text[];
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS owner_id           text;
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS type               storage.buckettype NOT NULL DEFAULT 'STANDARD';
+
+CREATE TABLE IF NOT EXISTS storage.objects (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  bucket_id        text REFERENCES storage.buckets(id),
+  name             text,
+  owner            uuid,
+  created_at       timestamptz DEFAULT now(),
+  updated_at       timestamptz DEFAULT now(),
+  last_accessed_at timestamptz DEFAULT now(),
+  metadata         jsonb,
+  path_tokens      text[],
+  version          text,
+  owner_id         text,
+  user_metadata    jsonb
+);
+
+-- A real project has RLS on both; migrations add policies assuming it.
+ALTER TABLE storage.buckets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
+
+-- Mirror prod: both tables are owned by supabase_storage_admin, with full grants
+-- to postgres / service_role / authenticated / anon.
+DO $shim$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'supabase_storage_admin') THEN
+    ALTER TABLE storage.buckets OWNER TO supabase_storage_admin;
+    ALTER TABLE storage.objects OWNER TO supabase_storage_admin;
+
+    GRANT ALL ON storage.buckets, storage.objects
+      TO postgres, service_role, authenticated, anon;
+
+    -- CREATE POLICY requires table ownership. On prod the applying identity can
+    -- create policies on storage.objects (verified: the event-expense-receipts
+    -- RESTRICTIVE policies exist there), but the container's postgres is neither
+    -- superuser nor the owner. Granting the owner role reproduces prod's EFFECTIVE
+    -- capability without making postgres a superuser — which would mask genuine
+    -- permission defects everywhere else in the replay.
+    GRANT supabase_storage_admin TO postgres;
+  END IF;
+END
+$shim$;
+SHIM
+  then
+    printf '\nMANAGED-SCHEMA SHIM FAILED on %s\n----- error (tail) -----\n' "$name" >&2
+    tail -n 30 "$out" >&2
+    return 1
+  fi
+  return 0
 }
 
 # Apply one SQL file as role postgres with the discipline SETs + ON_ERROR_STOP.
@@ -183,6 +301,12 @@ hdr "Starting clean containers ($PG_IMAGE)"
 start_container "$C1"
 start_container "$C2"
 log "  both containers ready"
+
+# Applied to BOTH containers identically, before either replay, so the
+# determinism dump-diff still compares like with like.
+managed_schema_shim "$C1"
+managed_schema_shim "$C2"
+log "  managed-schema shim applied (storage.buckets/objects at prod shape)"
 
 hdr "Applying ${#MIGRATIONS[@]} migrations to container 1 (version order)"
 apply_all "$C1" 1

@@ -9,7 +9,7 @@ name: migration-smoke
 #
 #   jobs:
 #     migration-smoke:
-#       uses: NexronS2025/nexron-ci/.github/workflows/migration-smoke.yml@v1
+#       uses: NexronSolutions/nexron-ci/.github/workflows/migration-smoke.yml@v1
 #
 # The replay logic lives in scripts/migration-smoke/replay-smoke.sh in THIS repo,
 # so the workflow checks this repo out alongside the caller to fetch the script.
@@ -47,7 +47,7 @@ jobs:
       - name: Checkout nexron-ci (replay-smoke script)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: NexronS2025/nexron-ci
+          repository: NexronSolutions/nexron-ci
           # Pin the script to the SAME immutable commit that @v1 resolved to for
           # this run, so callers keep using @v1 (reuse model intact, no
           # hand-bumping) yet can never be served retagged script code.
