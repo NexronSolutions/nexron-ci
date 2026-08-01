@@ -44,6 +44,7 @@ RUN_TAG="migsmoke-$$"
 C1="${RUN_TAG}-1"
 C2="${RUN_TAG}-2"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="$(mktemp -d)"
 
 # ---- logging helpers --------------------------------------------------------
@@ -60,6 +61,11 @@ trap cleanup EXIT
 # ---- preflight --------------------------------------------------------------
 command -v docker >/dev/null 2>&1 || fail "docker not found on PATH"
 command -v rg     >/dev/null 2>&1 || fail "ripgrep (rg) not found on PATH"
+# Ledger registration splits SQL with the helper below; fail fast rather than
+# part-way through a 100+ migration replay.
+command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH (needed to register the migration ledger)"
+[ -f "$SCRIPT_DIR/register-migration.py" ] \
+  || fail "register-migration.py missing next to replay-smoke.sh"
 [ -d "$MIGRATIONS_DIR" ] || fail "MIGRATIONS_DIR not found: $MIGRATIONS_DIR"
 
 # ---- discover migrations (non-recursive; timestamped only) ------------------
@@ -166,6 +172,8 @@ apply_all() {
   local name="$1" verbose="$2" f
   for f in "${MIGRATIONS[@]}"; do
     if apply_file "$name" "$f"; then
+      register_migration "$name" "$f" \
+        || fail "applied but could not register in the ledger: $(basename "$f")"
       if [ "$verbose" = "1" ]; then log "  APPLY OK  $(basename "$f")"; fi
     else
       fail "migration did not apply on a clean container: $(basename "$f")"
@@ -246,6 +254,47 @@ alter table storage.objects enable row level security;
 grant all on storage.buckets, storage.objects to ${APPLY_ROLE};
 "
 
+# Seed the migration LEDGER before replay. Plain-psql replay never writes
+# supabase_migrations.schema_migrations, so any migration that GUARDS on the
+# ledger (the cutover-fence prerequisite/attestation pattern) can never apply —
+# the gate then reports a failure that says nothing about the migration set.
+# Shape mirrors prod: version is the PK, statements is the body array.
+LEDGER_STUB_SQL="
+create schema if not exists supabase_migrations;
+create table if not exists supabase_migrations.schema_migrations (
+  version    text not null primary key,
+  statements text[],
+  name       text
+);
+"
+
+seed_ledger_stub() {
+  local name="$1" out
+  out="$WORKDIR/ledger.out"
+  if printf '%s\n' "$LEDGER_STUB_SQL" \
+        | docker exec -i "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" \
+            -X -q -v ON_ERROR_STOP=1 -f - >"$out" 2>&1; then
+    return 0
+  fi
+  printf '\nLEDGER STUB SEED FAILED on %s\n----- error (tail) -----\n' "$name" >&2
+  tail -n 40 "$out" >&2
+  return 1
+}
+
+# Record an applied migration in the ledger, mirroring `supabase db push`.
+register_migration() {
+  local name="$1" file="$2" out
+  out="$WORKDIR/register.out"
+  if python3 "$SCRIPT_DIR/register-migration.py" "$file" \
+        | docker exec -i "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" \
+            -X -q -v ON_ERROR_STOP=1 -f - >"$out" 2>&1; then
+    return 0
+  fi
+  printf '\nLEDGER REGISTER FAILED: %s\n----- error (tail) -----\n' "$file" >&2
+  tail -n 40 "$out" >&2
+  return 1
+}
+
 seed_storage_stub() {
   local name="$1" out
   out="$WORKDIR/seed.out"
@@ -292,6 +341,11 @@ seed_storage_stub "$C1" || fail "storage stub seed failed on container 1"
 seed_storage_stub "$C2" || fail "storage stub seed failed on container 2"
 log "  storage stub seeded on both containers (buckets + objects, RLS enabled)"
 
+hdr "Seeding migration ledger on both containers (ledger-guarded migrations)"
+seed_ledger_stub "$C1" || fail "ledger stub seed failed on container 1"
+seed_ledger_stub "$C2" || fail "ledger stub seed failed on container 2"
+log "  ledger seeded on both containers (supabase_migrations.schema_migrations)"
+
 hdr "Applying ${#MIGRATIONS[@]} migrations to container 1 (version order)"
 apply_all "$C1" 1
 
@@ -318,6 +372,7 @@ funcs="$(count_objects "$C1" "SELECT count(*) FROM pg_proc p JOIN pg_namespace n
 hdr "MIGRATION-SMOKE PASSED"
 log "  migrations applied:   ${#MIGRATIONS[@]}"
 log "  storage stub:         seeded on both containers (buckets + objects, RLS)"
+log "  migration ledger:     registered ${#MIGRATIONS[@]} rows (db push semantics)"
 log "  determinism:          OK (dumps identical modulo \\restrict)"
 log "  baseline PII gate:    OK (blocking signals: 0)"
 log "  public tables:        ${tables:-?}"
