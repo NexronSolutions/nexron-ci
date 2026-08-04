@@ -21,6 +21,12 @@
 #      (mirrors the Supabase CLI's non-recursive discovery).
 #   4. Determinism: pg_dump --schema-only both containers and asserts the dumps
 #      are byte-identical modulo per-invocation cosmetic tokens (\restrict).
+#   5. safeupdate parity (PNBHS 2026-08-04 incident): proves the pinned image's
+#      safeupdate guard behaves as prod's (bare UPDATE → 21000, WHERE true
+#      passes), then sweeps the FINAL post-replay function bodies for
+#      statement-initial UPDATE/DELETE without a syntactic WHERE — the exact
+#      predicate prod enforces on every PostgREST session. Self-testing: the
+#      sweep must flag an incident-shaped canary each run or the gate fails.
 #
 # Parameterised by env (portable; no repo-specific paths):
 #   MIGRATIONS_DIR  default: supabase/migrations
@@ -327,6 +333,287 @@ count_objects() {
   docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -t -A -c "$sql" 2>/dev/null | tr -d '[:space:]'
 }
 
+# ---- safeupdate parity leg (PNBHS 2026-08-04 incident, layer 2) --------------
+# Supabase session-preloads `safeupdate` on the PostgREST role (authenticator),
+# so at RUNTIME a bare UPDATE/DELETE (no syntactic WHERE) raises SQLSTATE 21000
+# on EVERY API call — including inside plpgsql bodies, temp tables included —
+# while this harness's apply path (role postgres, no safeupdate, function bodies
+# never planned at CREATE) replays the same migration green. That gap shipped a
+# ~19h outage: private.submit_registration_canonical carried two bare temp-table
+# UPDATEs, every replay/pgTAP/direct-SQL check passed, and every prod submit
+# 500'd. A replay harness that doesn't model prod's guard libraries is a control
+# weaker than its name.
+#
+# Because the guard fires at execution time, "just LOAD safeupdate during apply"
+# would NOT have caught it (the statements live inside function bodies, executed
+# only when the RPC runs). The honest CI-side control is therefore two-part:
+#   (a) GUARD PROOF — on the pinned image, prove safeupdate loads and actually
+#       blocks a bare UPDATE with 21000 while `WHERE true` passes. If the image
+#       ever drops or defangs the extension, the leg fails rather than silently
+#       asserting a guard that no longer exists.
+#   (b) FUNCTION-BODY SWEEP — after the full replay, statically scan the FINAL
+#       pg_proc bodies (sql/plpgsql, user schemas) for statement-initial
+#       UPDATE / DELETE FROM / WITH…UPDATE/DELETE with no syntactic WHERE —
+#       the exact predicate safeupdate enforces. Final-state scanning (not
+#       per-file) means a later CREATE OR REPLACE that fixes a body clears the
+#       gate, mirroring what prod would execute. The sanctioned annotation for
+#       an intentional full-table statement is `WHERE true` (the #227 fix
+#       pattern) — there is deliberately no allowlist.
+#   The sweep SELF-TESTS on every run: it must flag a canary function shaped
+#   exactly like the incident (bare temp-table UPDATE) and must NOT flag its
+#   `WHERE true` twin, or the leg fails — a check that cannot fail is
+#   decoration.
+#
+# Known limitations (documented, not silently ignored): dynamic SQL inside
+# EXECUTE '…' literals, statements hidden behind a semicolon inside a string
+# literal, and a bare data-modifying CTE living entirely inside parentheses
+# (WITH x AS (UPDATE …) SELECT …) are not parsed; all are rare and reviewable
+# surface.
+# Helper functions for the sweep (created on C1 AFTER the determinism dumps,
+# torn down with the canaries). Both are bounded-iteration normalisers:
+#   strip_case_exprs — removes CASE *expressions* (case…end with no ';' inside;
+#     CASE *statements* contain ';' so they are never touched) so their then/
+#     else keywords can't masquerade as block boundaries when we split.
+#   strip_parens — removes parenthesised groups innermost-out, so a WHERE that
+#     lives only in a subquery/CTE cannot exempt a statement with no top-level
+#     WHERE (safeupdate checks the top-level qual, not any nested one).
+
+# The fragmenting split includes plpgsql block keywords (begin/then/else/loop/
+# return query), not just '';'', so a statement opening a block ("BEGIN UPDATE",
+# "IF … THEN UPDATE", "FOR … LOOP UPDATE") still lands at a fragment start —
+# the r1 HIGH-1 gap. CASE expressions are stripped BEFORE splitting so their
+# then/else don''t shred a legitimate statement into a false positive.
+SWEEP_SQL="
+with fn as (
+  select n.nspname as schema, p.proname as fname,
+         migsmoke_check.strip_case_exprs(
+           lower(regexp_replace(p.prosrc, '--[^\n]*', '', 'g'))
+         ) as body
+  from pg_proc p
+  join pg_namespace n on n.oid = p.pronamespace
+  join pg_language l on l.oid = p.prolang
+  where l.lanname in ('sql', 'plpgsql')
+    and n.nspname not in (
+      'pg_catalog', 'information_schema', 'extensions', 'auth', 'storage',
+      'realtime', 'supabase_functions', 'graphql', 'graphql_public',
+      'pgsodium', 'pgsodium_masks', 'vault', 'net', 'cron', 'pgbouncer',
+      'repack', '_analytics', '_realtime', 'topology', 'tiger', 'tiger_data',
+      'pgtle', 'dbdev', 'pgmq', 'migsmoke_check'
+    )
+),
+stmts as (
+  -- btrim with an explicit set: SQL trim() strips spaces ONLY, and split
+  -- fragments open with whatever whitespace followed the prior boundary — a
+  -- space-only trim leaves '^update' unanchorable (caught by the self-test).
+  select fn.schema, fn.fname, t.ord, btrim(t.stmt, E' \t\n\r') as stmt
+  from fn, regexp_split_to_table(fn.body,
+         '(;|\mbegin\M|\mthen\M|\melse\M|\mloop\M|\mreturn\s+query\M)'
+       ) with ordinality as t(stmt, ord)
+)
+select schema || '.' || fname || ' [frag ' || ord || '] '
+       || left(regexp_replace(stmt, '\s+', ' ', 'g'), 100)
+from stmts
+where (
+        (    stmt ~ '^(update\s|delete\s+from\s)'
+         -- top-level WHERE only: parenthesised (subquery/CTE) WHEREs are
+         -- stripped first, so they cannot exempt the statement (r1 HIGH-2).
+         and migsmoke_check.strip_parens(stmt) !~ '\mwhere\M')
+     -- codex r2 HIGH: the WITH branch must also judge the PAREN-STRIPPED text,
+     -- or a WHERE inside the CTE body exempts bare top-level DML. After the
+     -- strip, only the top-level clause survives. (A bare data-modifying CTE
+     -- entirely inside parens is stripped too — documented limitation below.)
+     or (stmt ~ '^with\s'
+         and migsmoke_check.strip_parens(stmt) ~ '\m(update|delete)\M'
+         and migsmoke_check.strip_parens(stmt) !~ '\mwhere\M')
+      )
+order by 1;
+"
+
+# The guard-proof sessions connect as GUARD_ROLE (default supabase_admin, the
+# image superuser) over the TCP-trust path: supautils restricts LOAD for the
+# apply role `postgres` ("access to library \"safeupdate\" is not allowed").
+# Role choice does not weaken the proof — safeupdate's WHERE-clause check is
+# session-wide and role-agnostic once loaded; prod attaches it to authenticator
+# via session_preload_libraries the same way.
+GUARD_ROLE="${GUARD_ROLE:-supabase_admin}"
+
+safeupdate_guard_proof() {
+  local name="$1" out rc
+  out="$WORKDIR/safeupdate-proof.out"
+  # Bare UPDATE under safeupdate MUST fail (the whole point of the guard)…
+  rc=0
+  docker exec -i "$name" psql -h 127.0.0.1 -U "$GUARD_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' >"$out" 2>&1 || rc=$?
+LOAD 'safeupdate';
+begin;
+create temporary table migsmoke_guard_canary (x int) on commit drop;
+insert into migsmoke_guard_canary values (1);
+update migsmoke_guard_canary set x = 2;
+commit;
+SQL
+  if [ "$rc" -eq 0 ]; then
+    fail "safeupdate guard proof: a bare UPDATE was NOT blocked on $PG_IMAGE — the image no longer models prod's guard; do not trust this leg (or the image pin) until resolved"
+  fi
+  grep -qiE "WHERE clause|21000" "$out" \
+    || { tail -n 10 "$out" >&2; fail "safeupdate guard proof: bare UPDATE failed for an unexpected reason (not the safeupdate WHERE-clause guard)"; }
+  # …and the sanctioned `WHERE true` escape hatch MUST pass.
+  rc=0
+  docker exec -i "$name" psql -h 127.0.0.1 -U "$GUARD_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' >"$out" 2>&1 || rc=$?
+LOAD 'safeupdate';
+begin;
+create temporary table migsmoke_guard_canary2 (x int) on commit drop;
+insert into migsmoke_guard_canary2 values (1);
+update migsmoke_guard_canary2 set x = 2 where true;
+commit;
+SQL
+  if [ "$rc" -ne 0 ]; then
+    tail -n 10 "$out" >&2
+    fail "safeupdate guard proof: UPDATE … WHERE true was blocked — guard semantics differ from the assumed model"
+  fi
+  return 0
+}
+
+run_sweep() {
+  # Prints one offender per line; empty output = clean. psql errors fail closed
+  # via ON_ERROR_STOP + the caller's rc check (never swallow a scanner error).
+  local name="$1"
+  docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" \
+    -X -t -A -v ON_ERROR_STOP=1 -c "$SWEEP_SQL"
+}
+
+safeupdate_sweep() {
+  local name="$1" selftest_out sweep_out rc
+  # Normaliser helpers (schema migsmoke_check) — torn down with the canaries.
+  rc=0
+  docker exec -i "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' >"$WORKDIR/sweep-helpers.out" 2>&1 || rc=$?
+create schema migsmoke_check;
+create function migsmoke_check.strip_case_exprs(t text) returns text
+language plpgsql immutable as $h$
+declare prev text;
+begin
+  for i in 1..50 loop
+    prev := t;
+    t := regexp_replace(t, '\mcase\M[^;]*?\mend\M', ' ', 'g');
+    exit when t = prev;
+  end loop;
+  return t;
+end
+$h$;
+create function migsmoke_check.strip_parens(t text) returns text
+language plpgsql immutable as $h$
+declare prev text;
+begin
+  for i in 1..50 loop
+    prev := t;
+    t := regexp_replace(t, '\([^()]*\)', ' ', 'g');
+    exit when t = prev;
+  end loop;
+  return t;
+end
+$h$;
+SQL
+  [ "$rc" -eq 0 ] || { tail -n 10 "$WORKDIR/sweep-helpers.out" >&2; fail "safeupdate sweep: helper install failed"; }
+
+  # Self-test first: the sweep must catch the incident shape and pass its twin.
+  rc=0
+  docker exec -i "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' >"$WORKDIR/sweep-selftest-setup.out" 2>&1 || rc=$?
+create schema migsmoke_selftest;
+create function migsmoke_selftest.canary_bare_update() returns void
+language plpgsql as $fn$
+begin
+  create temporary table if not exists tmp_migsmoke_canary (x int) on commit drop;
+  -- the 2026-08-04 incident shape: temp-table UPDATE, no WHERE
+  update tmp_migsmoke_canary set x = 1;
+end
+$fn$;
+create function migsmoke_selftest.canary_where_true() returns void
+language plpgsql as $fn$
+begin
+  create temporary table if not exists tmp_migsmoke_canary2 (x int) on commit drop;
+  update tmp_migsmoke_canary2 set x = 1 where true;
+end
+$fn$;
+-- codex r1 HIGH-1: bare DML that OPENS a block must still be caught.
+create function migsmoke_selftest.canary_first_in_block() returns void
+language plpgsql as $fn$
+begin
+  update tmp_migsmoke_canary set x = 2;
+end
+$fn$;
+create function migsmoke_selftest.canary_if_then() returns void
+language plpgsql as $fn$
+begin
+  if now() > '2020-01-01' then update tmp_migsmoke_canary set x = 3;
+  end if;
+end
+$fn$;
+-- codex r1 HIGH-2: a WHERE living only in a subquery must NOT exempt.
+create function migsmoke_selftest.canary_nested_where() returns void
+language plpgsql as $fn$
+begin
+  update tmp_migsmoke_canary set x = (select max(x) from tmp_migsmoke_canary where x > 0);
+end
+$fn$;
+-- codex r2 HIGH: a WHERE inside the CTE must not exempt bare top-level DML…
+create function migsmoke_selftest.canary_cte_bare_update() returns void
+language plpgsql as $fn$
+begin
+  with src as (select 1 as v where true)
+  update tmp_migsmoke_canary set x = src.v from src;
+end
+$fn$;
+-- …while a genuine top-level WHERE on the same shape stays clean.
+create function migsmoke_selftest.canary_cte_where_true() returns void
+language plpgsql as $fn$
+begin
+  with src as (select 1 as v)
+  update tmp_migsmoke_canary set x = src.v from src where true;
+end
+$fn$;
+-- CASE-expression robustness: top-level WHERE after a case expression is clean.
+create function migsmoke_selftest.canary_case_expr_where() returns void
+language plpgsql as $fn$
+begin
+  update tmp_migsmoke_canary set x = case when x = 1 then 2 else 3 end where x > 0;
+end
+$fn$;
+SQL
+  [ "$rc" -eq 0 ] || { tail -n 10 "$WORKDIR/sweep-selftest-setup.out" >&2; fail "safeupdate sweep self-test: canary setup failed"; }
+
+  rc=0
+  selftest_out="$(run_sweep "$name")" || rc=$?
+  [ "$rc" -eq 0 ] || fail "safeupdate sweep self-test: sweep query errored (rc=$rc) — refusing to pass (fail-closed)"
+  local must_flag c
+  for must_flag in canary_bare_update canary_first_in_block canary_if_then canary_nested_where canary_cte_bare_update; do
+    printf '%s\n' "$selftest_out" | grep -q "migsmoke_selftest\.$must_flag" \
+      || fail "safeupdate sweep self-test: the sweep did NOT flag $must_flag — the check is decoration; fix the sweep before trusting the gate"
+  done
+  for c in canary_where_true canary_case_expr_where canary_cte_where_true; do
+    if printf '%s\n' "$selftest_out" | grep -q "migsmoke_selftest\.$c"; then
+      fail "safeupdate sweep self-test: the sweep flagged $c — over-broad predicate would red every repo"
+    fi
+  done
+
+  # Canaries out; the migsmoke_check helpers stay — the production sweep uses them.
+  docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 \
+    -c 'drop schema migsmoke_selftest cascade;' >/dev/null 2>&1 \
+    || fail "safeupdate sweep self-test: canary teardown failed"
+
+  # Production sweep on the replayed final state.
+  rc=0
+  sweep_out="$(run_sweep "$name")" || rc=$?
+  [ "$rc" -eq 0 ] || fail "safeupdate sweep: sweep query errored (rc=$rc) — refusing to pass (fail-closed)"
+  docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 \
+    -c 'drop schema migsmoke_check cascade;' >/dev/null 2>&1 \
+    || fail "safeupdate sweep: helper teardown failed"
+  if [ -n "$sweep_out" ]; then
+    printf '\n  bare UPDATE/DELETE (no WHERE) in final function bodies — these raise SQLSTATE 21000 on every PostgREST call under prod safeupdate:\n' >&2
+    printf '%s\n' "$sweep_out" | sed 's/^/    /' >&2
+    printf '  fix: add a real WHERE, or `WHERE true` for an intentional full-table statement (the #227 pattern).\n' >&2
+    fail "safeupdate parity: $(printf '%s\n' "$sweep_out" | grep -c .) statement(s) prod would block at runtime"
+  fi
+  return 0
+}
+
 # ---- 2+3. start + apply -----------------------------------------------------
 hdr "Starting clean containers ($PG_IMAGE)"
 start_container "$C1"
@@ -365,6 +652,15 @@ else
   fail "non-deterministic replay: schema dumps differ between two clean applies"
 fi
 
+# ---- 5. safeupdate parity leg ----------------------------------------------
+# AFTER the determinism dumps: the sweep's canary objects live briefly on C1 and
+# must never be able to skew the dump comparison.
+hdr "safeupdate parity (guard proof + final function-body sweep)"
+safeupdate_guard_proof "$C1"
+log "  guard proof OK — bare UPDATE blocked (21000), WHERE true passes"
+safeupdate_sweep "$C1"
+log "  sweep OK — self-test caught the incident-shaped canary; final bodies carry no bare UPDATE/DELETE"
+
 # ---- summary ----------------------------------------------------------------
 tables="$(count_objects "$C1" "SELECT count(*) FROM pg_tables WHERE schemaname='public';")"
 funcs="$(count_objects "$C1" "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public';")"
@@ -374,6 +670,7 @@ log "  migrations applied:   ${#MIGRATIONS[@]}"
 log "  storage stub:         seeded on both containers (buckets + objects, RLS)"
 log "  migration ledger:     registered ${#MIGRATIONS[@]} rows (db push semantics)"
 log "  determinism:          OK (dumps identical modulo \\restrict)"
+log "  safeupdate parity:    OK (guard proven on image; function-body sweep clean)"
 log "  baseline PII gate:    OK (blocking signals: 0)"
 log "  public tables:        ${tables:-?}"
 log "  public functions:     ${funcs:-?}"
