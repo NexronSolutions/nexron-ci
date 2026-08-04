@@ -367,10 +367,26 @@ count_objects() {
 # Known limitations (documented, not silently ignored): dynamic SQL inside
 # EXECUTE '…' literals and statements hidden behind a semicolon inside a string
 # literal are not parsed; both are rare and reviewable surface.
+# Helper functions for the sweep (created on C1 AFTER the determinism dumps,
+# torn down with the canaries). Both are bounded-iteration normalisers:
+#   strip_case_exprs — removes CASE *expressions* (case…end with no ';' inside;
+#     CASE *statements* contain ';' so they are never touched) so their then/
+#     else keywords can't masquerade as block boundaries when we split.
+#   strip_parens — removes parenthesised groups innermost-out, so a WHERE that
+#     lives only in a subquery/CTE cannot exempt a statement with no top-level
+#     WHERE (safeupdate checks the top-level qual, not any nested one).
+
+# The fragmenting split includes plpgsql block keywords (begin/then/else/loop/
+# return query), not just '';'', so a statement opening a block ("BEGIN UPDATE",
+# "IF … THEN UPDATE", "FOR … LOOP UPDATE") still lands at a fragment start —
+# the r1 HIGH-1 gap. CASE expressions are stripped BEFORE splitting so their
+# then/else don''t shred a legitimate statement into a false positive.
 SWEEP_SQL="
 with fn as (
   select n.nspname as schema, p.proname as fname,
-         lower(regexp_replace(p.prosrc, '--[^\n]*', '', 'g')) as body
+         migsmoke_check.strip_case_exprs(
+           lower(regexp_replace(p.prosrc, '--[^\n]*', '', 'g'))
+         ) as body
   from pg_proc p
   join pg_namespace n on n.oid = p.pronamespace
   join pg_language l on l.oid = p.prolang
@@ -380,24 +396,28 @@ with fn as (
       'realtime', 'supabase_functions', 'graphql', 'graphql_public',
       'pgsodium', 'pgsodium_masks', 'vault', 'net', 'cron', 'pgbouncer',
       'repack', '_analytics', '_realtime', 'topology', 'tiger', 'tiger_data',
-      'pgtle', 'dbdev', 'pgmq'
+      'pgtle', 'dbdev', 'pgmq', 'migsmoke_check'
     )
 ),
 stmts as (
   -- btrim with an explicit set: SQL trim() strips spaces ONLY, and split
-  -- fragments open with the newline that followed the prior semicolon — a
+  -- fragments open with whatever whitespace followed the prior boundary — a
   -- space-only trim leaves '^update' unanchorable (caught by the self-test).
   select fn.schema, fn.fname, t.ord, btrim(t.stmt, E' \t\n\r') as stmt
-  from fn, regexp_split_to_table(fn.body, ';') with ordinality as t(stmt, ord)
+  from fn, regexp_split_to_table(fn.body,
+         '(;|\mbegin\M|\mthen\M|\melse\M|\mloop\M|\mreturn\s+query\M)'
+       ) with ordinality as t(stmt, ord)
 )
-select schema || '.' || fname || ' [stmt ' || ord || '] '
+select schema || '.' || fname || ' [frag ' || ord || '] '
        || left(regexp_replace(stmt, '\s+', ' ', 'g'), 100)
 from stmts
-where (   stmt ~ '^update\s'
-       or stmt ~ '^delete\s+from\s'
-       or (stmt ~ '^with\s' and stmt ~ '\m(update|delete)\M')
+where (
+        (    stmt ~ '^(update\s|delete\s+from\s)'
+         -- top-level WHERE only: parenthesised (subquery/CTE) WHEREs are
+         -- stripped first, so they cannot exempt the statement (r1 HIGH-2).
+         and migsmoke_check.strip_parens(stmt) !~ '\mwhere\M')
+     or (stmt ~ '^with\s' and stmt ~ '\m(update|delete)\M' and stmt !~ '\mwhere\M')
       )
-  and stmt !~ '\mwhere\M'
 order by 1;
 "
 
@@ -454,6 +474,37 @@ run_sweep() {
 
 safeupdate_sweep() {
   local name="$1" selftest_out sweep_out rc
+  # Normaliser helpers (schema migsmoke_check) — torn down with the canaries.
+  rc=0
+  docker exec -i "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' >"$WORKDIR/sweep-helpers.out" 2>&1 || rc=$?
+create schema migsmoke_check;
+create function migsmoke_check.strip_case_exprs(t text) returns text
+language plpgsql immutable as $h$
+declare prev text;
+begin
+  for i in 1..50 loop
+    prev := t;
+    t := regexp_replace(t, '\mcase\M[^;]*?\mend\M', ' ', 'g');
+    exit when t = prev;
+  end loop;
+  return t;
+end
+$h$;
+create function migsmoke_check.strip_parens(t text) returns text
+language plpgsql immutable as $h$
+declare prev text;
+begin
+  for i in 1..50 loop
+    prev := t;
+    t := regexp_replace(t, '\([^()]*\)', ' ', 'g');
+    exit when t = prev;
+  end loop;
+  return t;
+end
+$h$;
+SQL
+  [ "$rc" -eq 0 ] || { tail -n 10 "$WORKDIR/sweep-helpers.out" >&2; fail "safeupdate sweep: helper install failed"; }
+
   # Self-test first: the sweep must catch the incident shape and pass its twin.
   rc=0
   docker exec -i "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 <<'SQL' >"$WORKDIR/sweep-selftest-setup.out" 2>&1 || rc=$?
@@ -473,18 +524,52 @@ begin
   update tmp_migsmoke_canary2 set x = 1 where true;
 end
 $fn$;
+-- codex r1 HIGH-1: bare DML that OPENS a block must still be caught.
+create function migsmoke_selftest.canary_first_in_block() returns void
+language plpgsql as $fn$
+begin
+  update tmp_migsmoke_canary set x = 2;
+end
+$fn$;
+create function migsmoke_selftest.canary_if_then() returns void
+language plpgsql as $fn$
+begin
+  if now() > '2020-01-01' then update tmp_migsmoke_canary set x = 3;
+  end if;
+end
+$fn$;
+-- codex r1 HIGH-2: a WHERE living only in a subquery must NOT exempt.
+create function migsmoke_selftest.canary_nested_where() returns void
+language plpgsql as $fn$
+begin
+  update tmp_migsmoke_canary set x = (select max(x) from tmp_migsmoke_canary where x > 0);
+end
+$fn$;
+-- CASE-expression robustness: top-level WHERE after a case expression is clean.
+create function migsmoke_selftest.canary_case_expr_where() returns void
+language plpgsql as $fn$
+begin
+  update tmp_migsmoke_canary set x = case when x = 1 then 2 else 3 end where x > 0;
+end
+$fn$;
 SQL
   [ "$rc" -eq 0 ] || { tail -n 10 "$WORKDIR/sweep-selftest-setup.out" >&2; fail "safeupdate sweep self-test: canary setup failed"; }
 
   rc=0
   selftest_out="$(run_sweep "$name")" || rc=$?
   [ "$rc" -eq 0 ] || fail "safeupdate sweep self-test: sweep query errored (rc=$rc) — refusing to pass (fail-closed)"
-  printf '%s\n' "$selftest_out" | grep -q 'migsmoke_selftest\.canary_bare_update' \
-    || fail "safeupdate sweep self-test: the sweep did NOT flag the incident-shaped canary — the check is decoration; fix the sweep before trusting the gate"
-  if printf '%s\n' "$selftest_out" | grep -q 'migsmoke_selftest\.canary_where_true'; then
-    fail "safeupdate sweep self-test: the sweep flagged the WHERE-true twin — over-broad predicate would red every repo"
-  fi
+  local must_flag c
+  for must_flag in canary_bare_update canary_first_in_block canary_if_then canary_nested_where; do
+    printf '%s\n' "$selftest_out" | grep -q "migsmoke_selftest\.$must_flag" \
+      || fail "safeupdate sweep self-test: the sweep did NOT flag $must_flag — the check is decoration; fix the sweep before trusting the gate"
+  done
+  for c in canary_where_true canary_case_expr_where; do
+    if printf '%s\n' "$selftest_out" | grep -q "migsmoke_selftest\.$c"; then
+      fail "safeupdate sweep self-test: the sweep flagged $c — over-broad predicate would red every repo"
+    fi
+  done
 
+  # Canaries out; the migsmoke_check helpers stay — the production sweep uses them.
   docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 \
     -c 'drop schema migsmoke_selftest cascade;' >/dev/null 2>&1 \
     || fail "safeupdate sweep self-test: canary teardown failed"
@@ -493,6 +578,9 @@ SQL
   rc=0
   sweep_out="$(run_sweep "$name")" || rc=$?
   [ "$rc" -eq 0 ] || fail "safeupdate sweep: sweep query errored (rc=$rc) — refusing to pass (fail-closed)"
+  docker exec "$name" psql -U "$APPLY_ROLE" -d "$APPLY_DB" -X -q -v ON_ERROR_STOP=1 \
+    -c 'drop schema migsmoke_check cascade;' >/dev/null 2>&1 \
+    || fail "safeupdate sweep: helper teardown failed"
   if [ -n "$sweep_out" ]; then
     printf '\n  bare UPDATE/DELETE (no WHERE) in final function bodies — these raise SQLSTATE 21000 on every PostgREST call under prod safeupdate:\n' >&2
     printf '%s\n' "$sweep_out" | sed 's/^/    /' >&2
