@@ -365,8 +365,10 @@ count_objects() {
 #   decoration.
 #
 # Known limitations (documented, not silently ignored): dynamic SQL inside
-# EXECUTE '…' literals and statements hidden behind a semicolon inside a string
-# literal are not parsed; both are rare and reviewable surface.
+# EXECUTE '…' literals, statements hidden behind a semicolon inside a string
+# literal, and a bare data-modifying CTE living entirely inside parentheses
+# (WITH x AS (UPDATE …) SELECT …) are not parsed; all are rare and reviewable
+# surface.
 # Helper functions for the sweep (created on C1 AFTER the determinism dumps,
 # torn down with the canaries). Both are bounded-iteration normalisers:
 #   strip_case_exprs — removes CASE *expressions* (case…end with no ';' inside;
@@ -416,7 +418,13 @@ where (
          -- top-level WHERE only: parenthesised (subquery/CTE) WHEREs are
          -- stripped first, so they cannot exempt the statement (r1 HIGH-2).
          and migsmoke_check.strip_parens(stmt) !~ '\mwhere\M')
-     or (stmt ~ '^with\s' and stmt ~ '\m(update|delete)\M' and stmt !~ '\mwhere\M')
+     -- codex r2 HIGH: the WITH branch must also judge the PAREN-STRIPPED text,
+     -- or a WHERE inside the CTE body exempts bare top-level DML. After the
+     -- strip, only the top-level clause survives. (A bare data-modifying CTE
+     -- entirely inside parens is stripped too — documented limitation below.)
+     or (stmt ~ '^with\s'
+         and migsmoke_check.strip_parens(stmt) ~ '\m(update|delete)\M'
+         and migsmoke_check.strip_parens(stmt) !~ '\mwhere\M')
       )
 order by 1;
 "
@@ -545,6 +553,22 @@ begin
   update tmp_migsmoke_canary set x = (select max(x) from tmp_migsmoke_canary where x > 0);
 end
 $fn$;
+-- codex r2 HIGH: a WHERE inside the CTE must not exempt bare top-level DML…
+create function migsmoke_selftest.canary_cte_bare_update() returns void
+language plpgsql as $fn$
+begin
+  with src as (select 1 as v where true)
+  update tmp_migsmoke_canary set x = src.v from src;
+end
+$fn$;
+-- …while a genuine top-level WHERE on the same shape stays clean.
+create function migsmoke_selftest.canary_cte_where_true() returns void
+language plpgsql as $fn$
+begin
+  with src as (select 1 as v)
+  update tmp_migsmoke_canary set x = src.v from src where true;
+end
+$fn$;
 -- CASE-expression robustness: top-level WHERE after a case expression is clean.
 create function migsmoke_selftest.canary_case_expr_where() returns void
 language plpgsql as $fn$
@@ -559,11 +583,11 @@ SQL
   selftest_out="$(run_sweep "$name")" || rc=$?
   [ "$rc" -eq 0 ] || fail "safeupdate sweep self-test: sweep query errored (rc=$rc) — refusing to pass (fail-closed)"
   local must_flag c
-  for must_flag in canary_bare_update canary_first_in_block canary_if_then canary_nested_where; do
+  for must_flag in canary_bare_update canary_first_in_block canary_if_then canary_nested_where canary_cte_bare_update; do
     printf '%s\n' "$selftest_out" | grep -q "migsmoke_selftest\.$must_flag" \
       || fail "safeupdate sweep self-test: the sweep did NOT flag $must_flag — the check is decoration; fix the sweep before trusting the gate"
   done
-  for c in canary_where_true canary_case_expr_where; do
+  for c in canary_where_true canary_case_expr_where canary_cte_where_true; do
     if printf '%s\n' "$selftest_out" | grep -q "migsmoke_selftest\.$c"; then
       fail "safeupdate sweep self-test: the sweep flagged $c — over-broad predicate would red every repo"
     fi
